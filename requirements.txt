@@ -1,7 +1,4 @@
 streamlit
-pandas
 plotly
-pillow
-numpy
-scipy
-scikit-image
+pandas
+matplotlib
