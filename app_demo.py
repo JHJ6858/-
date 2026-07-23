@@ -181,8 +181,11 @@ def _cm_metrics(cm):
 
 
 @st.cache_data(show_spinner="전체 테스트셋 추론 + 성능 평가 중… (최초 1회, 이미지 수에 따라 수십 초~수 분)")
-def evaluate_all(filenames, tau, seg_tag, sev_tag):
-    """테스트셋 전체에 두 모델을 실행해 세그·중증도 지표를 집계."""
+def evaluate_all(filenames, tau, crop_mode, seg_tag, sev_tag):
+    """테스트셋 전체에 두 모델을 실행해 세그·중증도 지표를 집계.
+    crop_mode='pred' : 예측 마스크로 크롭 (end-to-end, 실제 배포 성능)
+    crop_mode='gt'   : 정답 마스크로 크롭 (중증도 모델 단독 성능, 카드 수치 재현)
+    """
     seg = get_seg(); sev = get_sev()
     dices, ious = [], []
     tp = fp = fn = 0
@@ -194,9 +197,10 @@ def evaluate_all(filenames, tau, seg_tag, sev_tag):
         if not os.path.exists(ip):
             continue
         orig = np.array(Image.open(ip).convert("RGB"))
-        out = M.run_full(orig, seg, sev, tau=tau)
-        mask = out["mask"]
+        mask = M.sigmoid(seg.predict_logit(orig)) >= tau     # 512x512 bool (예측)
+        # ---- 세그 지표 + GT 마스크 로드 ----
         gp = f"{ASSETS}/gt/{name}.png"
+        gt = None
         if os.path.exists(gp):
             gt = np.array(Image.open(gp).convert("L").resize((512, 512), Image.NEAREST)) > 127
             if gt.sum() > 0:
@@ -205,6 +209,14 @@ def evaluate_all(filenames, tau, seg_tag, sev_tag):
                 ious.append(inter / uni if uni else 0.0)
                 dices.append(2 * inter / (ga + pa) if (ga + pa) else 0.0)
                 tp += inter; fp += pa - inter; fn += ga - inter
+        # ---- 중증도: 크롭 소스 선택 ----
+        if crop_mode == "gt" and gt is not None:
+            cmask = gt                                       # 정답 마스크로 크롭
+        else:
+            cmask = mask                                     # 예측 마스크로 크롭
+        area = float(cmask.sum()) / cmask.size
+        crop = M.lesion_bbox_crop(orig, cmask, pad=0.15)
+        grades = sev.predict(crop, area)
         r = rows.get(name)
         if r is not None:
             for m in M.SEV_ORDER:
@@ -212,7 +224,7 @@ def evaluate_all(filenames, tau, seg_tag, sev_tag):
                 gl = r.get(m)
                 if pd.isna(gl) or gl not in classes:
                     continue
-                pi = out["grades"].get(m)
+                pi = grades.get(m)
                 if pi is None:
                     continue
                 ti = classes.index(gl)
@@ -404,6 +416,14 @@ with tab_eval:
     if df is None:
         st.info("demo_assets/results.csv 가 없어 성능 평가를 할 수 없습니다.")
     else:
+        mode_label = st.radio(
+            "중증도 평가 모드",
+            ["end-to-end (예측 마스크 크롭 · 실제 배포 성능)",
+             "단독 (GT 마스크 크롭 · 모델 카드 수치 재현)"],
+            help="단독 모드는 정답 마스크로 크롭해 중증도 모델 실력만 측정합니다. "
+                 "카드의 QWK 수치와 직접 비교하려면 이 모드를 쓰세요.")
+        crop_mode = "gt" if mode_label.startswith("단독") else "pred"
+
         colt, colb = st.columns([2, 1])
         tau_e = colt.slider("세그 임계값 τ (평가 기준)", 0.05, 0.95, 0.50, 0.05, key="eval_tau")
         run_eval = colb.button("▶ 성능 평가 실행", type="primary")
@@ -413,7 +433,7 @@ with tab_eval:
         else:
             seg_tag = f"{SEG_PATH}:{os.path.getmtime(SEG_PATH)}"
             sev_tag = f"{SEV_PATH}:{os.path.getmtime(SEV_PATH)}"
-            ev = evaluate_all(tuple(sorted(df["filename"].tolist())), tau_e, seg_tag, sev_tag)
+            ev = evaluate_all(tuple(sorted(df["filename"].tolist())), tau_e, crop_mode, seg_tag, sev_tag)
 
             # ----- 병변 분할 -----
             st.markdown("### 🟥 병변 분할 — EfficientNet-B0 + UNet++")
@@ -428,7 +448,10 @@ with tab_eval:
 
             st.divider()
             # ----- 중증도 분류 -----
-            st.markdown("### 🟦 중증도 분류 — PVTv2-B0 + CORN")
+            _mode_txt = "단독 (GT 마스크 크롭)" if crop_mode == "gt" else "end-to-end (예측 마스크 크롭)"
+            st.markdown(f"### 🟦 중증도 분류 — PVTv2-B0 + CORN  ·  모드: {_mode_txt}")
+            if crop_mode == "gt":
+                st.caption("👉 이 표의 **QWK 열**을 모델 카드 수치(IGA 0.704 등)와 직접 비교하세요.")
             summ = [{"지표": METRIC_KO[m], "N": ev["sev"][m]["n"],
                      "정확도": ev["sev"][m]["acc"], "MAE": ev["sev"][m]["mae"],
                      "QWK": ev["sev"][m]["qwk"]} for m in M.SEV_ORDER]
