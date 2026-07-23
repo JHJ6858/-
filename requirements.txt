@@ -1,6 +1,6 @@
 streamlit
-plotly
-pillow
 numpy
-scipy
-scikit-image
+pandas
+pillow
+plotly
+ai-edge-litert
