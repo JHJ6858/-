@@ -42,6 +42,12 @@ SEV_COLOR = {"None": "#9AA5B1", "Mild": "#F2C94C", "Moderate": "#F2994A",
 METRIC_KO = {"iga": "IGA 등급", "erythema": "홍반", "papulation": "구진/부종",
              "excoriation": "상처", "lichenification": "태선화"}
 
+# ==================== 모델 카드 (보고된 성능 · 학습 결과 고정값) ====================
+SEG_CARD = {"dice": 0.8318, "iou": 0.7335, "res": 512, "params": "6.57M"}
+SEV_CARD = {"iga": 0.704, "params": "3.41M",
+            "erythema": 0.565, "papulation": 0.514,
+            "excoriation": 0.580, "lichenification": 0.597}  # 증상은 QWK 기준
+
 
 # ==================== 모델 로딩 (캐시) ====================
 @st.cache_resource(show_spinner="병변분할 모델(EfficientNet-B0+UNet++) 로딩 중…")
@@ -139,6 +145,28 @@ def sweep_live(filenames, thresholds, seg_tag):
         return None
     return {"thr": ths, "dice": dice / used, "iou": iou / used,
             "precision": prec / used, "recall": rec / used, "n": used}
+
+
+@st.cache_data(show_spinner="정렬용 세그 추론 중… (최초 1회, 이미지 수에 따라 수십 초)")
+def per_image_scores(filenames, tau, seg_tag):
+    """정렬용: 이미지별 Dice/IoU를 세그 모델로 계산 (정답 마스크 있는 것만)."""
+    seg = get_seg()
+    out = {}
+    for fn in filenames:
+        ip = f"{ASSETS}/images/{fn}.png"; gp = f"{ASSETS}/gt/{fn}.png"
+        dice = iou = float("nan")
+        if os.path.exists(ip) and os.path.exists(gp):
+            orig = np.array(Image.open(ip).convert("RGB"))
+            mask = M.sigmoid(seg.predict_logit(orig)) >= tau
+            gt = np.array(Image.open(gp).convert("L").resize((512, 512), Image.NEAREST)) > 127
+            inter = int((gt & mask).sum()); uni = int((gt | mask).sum())
+            ga = int(gt.sum()); pa = int(mask.sum())
+            if uni:
+                iou = inter / uni
+            if ga + pa:
+                dice = 2 * inter / (ga + pa)
+        out[fn] = {"dice": dice, "iou": iou}
+    return out
 
 
 def show_grades(grades, gt_row=None):
@@ -252,6 +280,34 @@ def conf_heatmap(cm, classes, title):
     return fig
 
 
+def model_cards():
+    """학습 때 보고된 성능 카드(고정 숫자)를 표시."""
+    seg_html = (
+        "<div style='background:linear-gradient(135deg,#16233f,#241a3a);color:#fff;"
+        "border-radius:12px;padding:14px 18px;height:100%'>"
+        "<div style='color:#7fe3c0;font-weight:700;font-size:1.02rem'>EfficientNet-B0 + UNet++</div>"
+        f"<div style='font-size:1.45rem;font-weight:800;margin:6px 0'>DICE {SEG_CARD['dice']:.4f}"
+        f"&nbsp;&nbsp;|&nbsp;&nbsp;IoU {SEG_CARD['iou']:.4f}</div>"
+        f"<div style='color:#aeb8cf;font-size:0.85rem'>해상도 {SEG_CARD['res']} · Params {SEG_CARD['params']}</div>"
+        "</div>")
+    syms = " &nbsp;|&nbsp; ".join(
+        f"{s} {SEV_CARD[k]:.3f}" for k, s in
+        [("erythema", "홍반"), ("papulation", "구진"), ("excoriation", "상처"), ("lichenification", "태선")])
+    sev_html = (
+        "<div style='background:linear-gradient(135deg,#2a1a3f,#16233f);color:#fff;"
+        "border-radius:12px;padding:14px 18px;height:100%'>"
+        "<div style='color:#f0c674;font-weight:700;font-size:1.02rem'>PVTv2-B0 (Best IGA)</div>"
+        f"<div style='font-size:1.45rem;font-weight:800;margin:6px 0'>IGA {SEV_CARD['iga']:.3f}"
+        f"&nbsp;&nbsp;|&nbsp;&nbsp;Params {SEV_CARD['params']}</div>"
+        f"<div style='color:#aeb8cf;font-size:0.85rem'>{syms}</div>"
+        "</div>")
+    c1, c2 = st.columns(2)
+    c1.markdown(seg_html, unsafe_allow_html=True)
+    c2.markdown(sev_html, unsafe_allow_html=True)
+    st.caption("📋 학습 때 보고된 성능(모델 카드). 세그는 Dice/IoU, 중증도는 QWK 기준. "
+               "아래 '성능 평가 실행' 결과와 비교해 보세요.")
+
+
 # ==================== 헤더 ====================
 st.title("🔬 아토피 병변 검출 — 실시간 추론 데모")
 st.caption("EfficientNet-B0 + UNet++ 병변분할 · PVTv2-B0 + CORN 중증도 분류 · 앱에서 직접 추론")
@@ -290,13 +346,28 @@ with tab_view:
         with left:
             st.subheader("test 파일")
             st.caption(f"총 {len(df)}장")
-            d = df.copy().sort_values("filename")
+            d = df.copy()
             if "iga" in df.columns:
                 igas = ["전체"] + sorted(df["iga"].dropna().unique().tolist())
                 pick_iga = st.selectbox("IGA(정답) 필터", igas)
                 if pick_iga != "전체":
                     d = d[d["iga"] == pick_iga]
-            sel = st.radio("파일 선택", d["filename"].tolist())
+
+            sort_by = st.radio("정렬", ["파일명", "Dice 높은순", "Dice 낮은순",
+                                        "IoU 높은순", "IoU 낮은순"])
+            if sort_by == "파일명":
+                d = d.sort_values("filename")
+                fmt = lambda s: s
+            else:
+                key = "dice" if "Dice" in sort_by else "iou"
+                seg_tag = f"{SEG_PATH}:{os.path.getmtime(SEG_PATH)}"
+                scores = per_image_scores(tuple(sorted(df["filename"].tolist())), 0.50, seg_tag)
+                d = d.assign(_score=d["filename"].map(lambda f: scores.get(f, {}).get(key, float("nan"))))
+                d = d.sort_values("_score", ascending=("낮은순" in sort_by), na_position="last")
+                fmt = lambda s: f"{s}  ({key.upper()} {scores.get(s, {}).get(key, float('nan')):.2f})"
+                st.caption("정렬 점수는 τ=0.50 기준 (이미지별 슬라이더와 별개)")
+
+            sel = st.radio("파일 선택", d["filename"].tolist(), format_func=fmt)
 
         with mid:
             row = df[df["filename"] == sel].iloc[0]
@@ -413,9 +484,14 @@ with tab_eval:
     st.caption("병변분할(EfficientNet-B0+UNet++)과 중증도분류(PVTv2-B0+CORN)를 테스트셋 전체에 실행해 "
                "지표를 집계합니다. (최초 1회 전체 추론 후 캐시)")
 
+    st.markdown("#### 📋 보고된 성능 (모델 카드)")
+    model_cards()
+    st.divider()
+
     if df is None:
-        st.info("demo_assets/results.csv 가 없어 성능 평가를 할 수 없습니다.")
+        st.info("demo_assets/results.csv 가 없어 라이브 성능 평가를 할 수 없습니다. (위 카드는 학습 보고값)")
     else:
+        st.markdown("#### 🔬 라이브 평가 (앱에서 실제 추론)")
         mode_label = st.radio(
             "중증도 평가 모드",
             ["end-to-end (예측 마스크 크롭 · 실제 배포 성능)",
@@ -444,19 +520,22 @@ with tab_eval:
             g3.metric("Precision", f"{s['precision']:.3f}")
             g4.metric("Recall", f"{s['recall']:.3f}")
             st.caption(f"정답 병변 있는 이미지 {s['n']}장 기준 · τ={tau_e:.2f} · "
-                       "Dice/IoU는 이미지 평균, Precision/Recall은 픽셀 micro 평균")
+                       "Dice/IoU는 이미지 평균, Precision/Recall은 픽셀 micro 평균  ·  "
+                       f"📋 카드: Dice {SEG_CARD['dice']:.4f} / IoU {SEG_CARD['iou']:.4f}")
 
             st.divider()
             # ----- 중증도 분류 -----
             _mode_txt = "단독 (GT 마스크 크롭)" if crop_mode == "gt" else "end-to-end (예측 마스크 크롭)"
             st.markdown(f"### 🟦 중증도 분류 — PVTv2-B0 + CORN  ·  모드: {_mode_txt}")
             if crop_mode == "gt":
-                st.caption("👉 이 표의 **QWK 열**을 모델 카드 수치(IGA 0.704 등)와 직접 비교하세요.")
+                st.caption("👉 이 표의 **QWK(라이브) 열**을 QWK(카드) 열과 직접 비교하세요.")
             summ = [{"지표": METRIC_KO[m], "N": ev["sev"][m]["n"],
                      "정확도": ev["sev"][m]["acc"], "MAE": ev["sev"][m]["mae"],
-                     "QWK": ev["sev"][m]["qwk"]} for m in M.SEV_ORDER]
+                     "QWK(라이브)": ev["sev"][m]["qwk"], "QWK(카드)": SEV_CARD[m]}
+                    for m in M.SEV_ORDER]
             st.dataframe(
-                pd.DataFrame(summ).style.format({"정확도": "{:.3f}", "MAE": "{:.3f}", "QWK": "{:.3f}"}),
+                pd.DataFrame(summ).style.format(
+                    {"정확도": "{:.3f}", "MAE": "{:.3f}", "QWK(라이브)": "{:.3f}", "QWK(카드)": "{:.3f}"}),
                 hide_index=True, use_container_width=True)
             st.caption("정확도=정확히 맞춘 비율(↑좋음) · MAE=평균 등급오차(↓좋음) · "
                        "QWK=순서형 가중 카파(1에 가까울수록↑, 등급 순서까지 반영한 일치도)")
