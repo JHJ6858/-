@@ -27,8 +27,9 @@ import models as M
 st.set_page_config(page_title="아토피 검출 데모", layout="wide")
 
 ASSETS = "demo_assets"
-SEG_PATH = os.path.join("models", "seg_effb0_unetpp_512_fp16.tflite")
-SEV_PATH = os.path.join("models", "sev_pvt_v2_b0_corn_crop_area_512_fp16.tflite")
+SEG_PATH = "seg_effb0_unetpp_512_fp16.tflite"
+SEV_PATH = "sev_pvt_v2_b0_corn_crop_area_512_fp16.tflite"
+
 
 GT_COLOR = (0, 200, 0)      # 정답 = 초록
 PR_COLOR = (255, 40, 40)    # 예측 = 빨강
