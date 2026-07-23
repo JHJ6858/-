@@ -1,4 +1,6 @@
 streamlit
 plotly
-pandas
-matplotlib
+pillow
+numpy
+scipy
+scikit-image
