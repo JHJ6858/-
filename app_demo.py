@@ -39,6 +39,10 @@ PR_COLOR = (255, 40, 40)    # 예측 = 빨강
 SEV_COLOR = {"None": "#9AA5B1", "Mild": "#F2C94C", "Moderate": "#F2994A",
              "Severe": "#EB5757", "Clear": "#9AA5B1", "Almost Clear": "#BDBDBD"}
 
+# 등급 비교(예측 vs 정답) 색 — 맞춤=초록, 틀림=빨강
+GRADE_OK = "#27AE60"
+GRADE_BAD = "#EB5757"
+
 METRIC_KO = {"iga": "IGA 등급", "erythema": "홍반", "papulation": "구진/부종",
              "excoriation": "상처", "lichenification": "태선화"}
 
@@ -104,8 +108,9 @@ def overlay(img, mask_bool, color, alpha=0.45):
     return out.astype(np.uint8)
 
 
-def badge(label, value):
-    color = SEV_COLOR.get(str(value), "#9AA5B1")
+def badge(label, value, color=None):
+    if color is None:
+        color = SEV_COLOR.get(str(value), "#9AA5B1")
     st.markdown(
         f"<div style='display:inline-block;margin:3px;padding:6px 12px;border-radius:8px;"
         f"background:{color}22;border:1px solid {color};'>"
@@ -172,17 +177,33 @@ def per_image_scores(filenames, tau, seg_tag):
 
 
 def show_grades(grades, gt_row=None):
-    """예측 등급(모델) + (있으면) 정답 등급(csv)을 나란히 표시."""
+    """예측 등급(모델) + (있으면) 정답 등급(csv)을 나란히 표시.
+    정답이 있으면 예측·정답 배지 색을 일치 여부로 표시(맞춤=초록, 틀림=빨강).
+    정답 값이 비어있으면 'None'으로 표기."""
     cols = st.columns(5)
     for col, metric in zip(cols, M.SEV_ORDER):
         with col:
             st.markdown(f"**{METRIC_KO[metric]}**")
-            if metric in grades:
-                badge("예측", M.grade_label(metric, grades[metric]))
+
+            pred_label = M.grade_label(metric, grades[metric]) if metric in grades else None
+
+            # 정답 컬럼이 존재하면(gt_row 있음), NaN이어도 'None' 으로 표기
+            gt_label = None
+            if gt_row is not None and metric in gt_row:
+                gt_label = "None" if pd.isna(gt_row[metric]) else str(gt_row[metric])
+
+            # 예측·정답 둘 다 있으면 일치 여부로 색 결정
+            cmp_color = None
+            if gt_label is not None and pred_label is not None:
+                cmp_color = GRADE_OK if str(pred_label) == gt_label else GRADE_BAD
+
+            if pred_label is not None:
+                badge("예측", pred_label, color=cmp_color)
             else:
                 st.caption("출력 매핑 실패")
-            if gt_row is not None and metric in gt_row and pd.notna(gt_row[metric]):
-                badge("정답", gt_row[metric])
+
+            if gt_label is not None:
+                badge("정답", gt_label, color=cmp_color)
 
 
 # ==================== 성능 평가 계산 ====================
@@ -413,7 +434,7 @@ with tab_view:
                 if pa > 0:
                     r2.metric("검출 정확도(precision)", f"{inter / pa * 100:.1f}%")
 
-            st.markdown("##### 중증도 · 증상 — 🔵 모델 예측 vs 🟢 정답(라벨)")
+            st.markdown("##### 중증도 · 증상 — 예측/정답 배지 · 🟢 정답 맞춤 vs 🔴 정답 틀림")
             show_grades(out["grades"], gt_row=row)
             st.caption(f"검출 병변 면적비: {out['area'] * 100:.2f}%  ·  중증도 입력 크롭 크기: {out['crop'].shape[1]}×{out['crop'].shape[0]}")
 
