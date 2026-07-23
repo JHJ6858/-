@@ -5,13 +5,6 @@
 앱에서 TFLite 모델을 직접 실행해 결과를 표시합니다.
  · 병변 분할: EfficientNet-B0 + UNet++
  · 중증도 분류: PVTv2-B0 + CORN (IGA + 4증상 멀티헤드)
-
-폴더 구조:
-  app_demo.py
-  models.py
-  models/seg_effb0_unetpp_512_fp16.tflite
-  models/sev_pvt_v2_b0_corn_crop_area_512_fp16.tflite
-  demo_assets/images, gt, results.csv   (테스트셋 뷰어용 · 없으면 '이미지 추가' 탭만 사용)
 """
 import os
 import zipfile
@@ -27,9 +20,18 @@ import models as M
 st.set_page_config(page_title="아토피 검출 데모", layout="wide")
 
 ASSETS = "demo_assets"
-SEG_PATH = "seg_effb0_unetpp_512_fp16.tflite"
-SEV_PATH = "sev_pvt_v2_b0_corn_crop_area_512_fp16.tflite"
 
+
+def _find_model(fname):
+    """models/ 폴더 또는 저장소 루트 어디에 있든 .tflite를 찾음."""
+    for p in (os.path.join("models", fname), fname):
+        if os.path.exists(p):
+            return p
+    return os.path.join("models", fname)  # 없을 때(에러 메시지용 기본 경로)
+
+
+SEG_PATH = _find_model("seg_effb0_unetpp_512_fp16.tflite")
+SEV_PATH = _find_model("sev_pvt_v2_b0_corn_crop_area_512_fp16.tflite")
 
 GT_COLOR = (0, 200, 0)      # 정답 = 초록
 PR_COLOR = (255, 40, 40)    # 예측 = 빨강
@@ -153,6 +155,91 @@ def show_grades(grades, gt_row=None):
                 badge("정답", gt_row[metric])
 
 
+# ==================== 성능 평가 계산 ====================
+def _qwk(cm):
+    """Quadratic Weighted Kappa (순서형 등급 일치도)."""
+    cm = np.asarray(cm, float); K = cm.shape[0]; N = cm.sum()
+    if N == 0 or K < 2:
+        return float("nan")
+    idx = np.arange(K)
+    w = ((idx[:, None] - idx[None, :]) ** 2) / (K - 1) ** 2
+    E = np.outer(cm.sum(1), cm.sum(0)) / N
+    denom = (w * E).sum()
+    if denom == 0:
+        return float("nan")
+    return 1.0 - (w * cm).sum() / denom
+
+
+def _cm_metrics(cm):
+    cm = np.asarray(cm, float); N = cm.sum(); K = cm.shape[0]
+    if N == 0:
+        return {"n": 0, "acc": float("nan"), "mae": float("nan"), "qwk": float("nan")}
+    idx = np.arange(K)
+    acc = np.trace(cm) / N
+    mae = (np.abs(idx[:, None] - idx[None, :]) * cm).sum() / N
+    return {"n": int(N), "acc": float(acc), "mae": float(mae), "qwk": _qwk(cm)}
+
+
+@st.cache_data(show_spinner="전체 테스트셋 추론 + 성능 평가 중… (최초 1회, 이미지 수에 따라 수십 초~수 분)")
+def evaluate_all(filenames, tau, seg_tag, sev_tag):
+    """테스트셋 전체에 두 모델을 실행해 세그·중증도 지표를 집계."""
+    seg = get_seg(); sev = get_sev()
+    dices, ious = [], []
+    tp = fp = fn = 0
+    conf = {m: np.zeros((len(M.IGA_CLASSES if m == "iga" else M.SYMPTOM_CLASSES),) * 2, int)
+            for m in M.SEV_ORDER}
+    rows = {r["filename"]: r for _, r in df.iterrows()} if df is not None else {}
+    for name in filenames:
+        ip = f"{ASSETS}/images/{name}.png"
+        if not os.path.exists(ip):
+            continue
+        orig = np.array(Image.open(ip).convert("RGB"))
+        out = M.run_full(orig, seg, sev, tau=tau)
+        mask = out["mask"]
+        gp = f"{ASSETS}/gt/{name}.png"
+        if os.path.exists(gp):
+            gt = np.array(Image.open(gp).convert("L").resize((512, 512), Image.NEAREST)) > 127
+            if gt.sum() > 0:
+                inter = int((gt & mask).sum()); uni = int((gt | mask).sum())
+                ga = int(gt.sum()); pa = int(mask.sum())
+                ious.append(inter / uni if uni else 0.0)
+                dices.append(2 * inter / (ga + pa) if (ga + pa) else 0.0)
+                tp += inter; fp += pa - inter; fn += ga - inter
+        r = rows.get(name)
+        if r is not None:
+            for m in M.SEV_ORDER:
+                classes = M.IGA_CLASSES if m == "iga" else M.SYMPTOM_CLASSES
+                gl = r.get(m)
+                if pd.isna(gl) or gl not in classes:
+                    continue
+                pi = out["grades"].get(m)
+                if pi is None:
+                    continue
+                ti = classes.index(gl)
+                pi = max(0, min(int(pi), len(classes) - 1))
+                conf[m][ti, pi] += 1
+    seg_res = {"n": len(dices),
+               "dice": float(np.mean(dices)) if dices else float("nan"),
+               "iou": float(np.mean(ious)) if ious else float("nan"),
+               "precision": tp / (tp + fp) if (tp + fp) else float("nan"),
+               "recall": tp / (tp + fn) if (tp + fn) else float("nan")}
+    sev_res = {m: {"cm": conf[m].tolist(), **_cm_metrics(conf[m])} for m in M.SEV_ORDER}
+    return {"seg": seg_res, "sev": sev_res}
+
+
+def conf_heatmap(cm, classes, title):
+    cm = np.asarray(cm)
+    fig = go.Figure(data=go.Heatmap(
+        z=cm, x=classes, y=classes, colorscale="Blues",
+        text=cm, texttemplate="%{text}", textfont=dict(size=13),
+        showscale=False, xgap=2, ygap=2))
+    fig.update_layout(title=dict(text=title, font=dict(size=15)),
+                      xaxis=dict(title="예측", side="top"),
+                      yaxis=dict(title="정답", autorange="reversed"),
+                      height=300, margin=dict(l=10, r=10, t=60, b=10), font=dict(size=12))
+    return fig
+
+
 # ==================== 헤더 ====================
 st.title("🔬 아토피 병변 검출 — 실시간 추론 데모")
 st.caption("EfficientNet-B0 + UNet++ 병변분할 · PVTv2-B0 + CORN 중증도 분류 · 앱에서 직접 추론")
@@ -178,8 +265,8 @@ if not (os.path.exists(SEG_PATH) and os.path.exists(SEV_PATH)):
 ensure_assets()
 df = load_results()  # 없으면 None (뷰어 탭 비활성)
 
-tab_view, tab_sweep, tab_upload = st.tabs(
-    ["🖼️ 이미지별 뷰어", "📈 임계값(τ) 분석", "➕ 이미지 추가"])
+tab_view, tab_sweep, tab_eval, tab_upload = st.tabs(
+    ["🖼️ 이미지별 뷰어", "📈 임계값(τ) 분석", "📊 성능 평가", "➕ 이미지 추가"])
 
 # ==================== 탭1 — 이미지별 뷰어 ====================
 with tab_view:
@@ -308,7 +395,59 @@ with tab_sweep:
                                                "Precision": "{:.3f}", "Recall": "{:.3f}"}),
                              hide_index=True, use_container_width=True, height=320)
 
-# ==================== 탭3 — 이미지 추가 ====================
+# ==================== 탭3 — 성능 평가 ====================
+with tab_eval:
+    st.subheader("성능 평가 — 두 모델 (테스트셋 전체 실시간 추론)")
+    st.caption("병변분할(EfficientNet-B0+UNet++)과 중증도분류(PVTv2-B0+CORN)를 테스트셋 전체에 실행해 "
+               "지표를 집계합니다. (최초 1회 전체 추론 후 캐시)")
+
+    if df is None:
+        st.info("demo_assets/results.csv 가 없어 성능 평가를 할 수 없습니다.")
+    else:
+        colt, colb = st.columns([2, 1])
+        tau_e = colt.slider("세그 임계값 τ (평가 기준)", 0.05, 0.95, 0.50, 0.05, key="eval_tau")
+        run_eval = colb.button("▶ 성능 평가 실행", type="primary")
+
+        if not run_eval:
+            st.info("위 버튼을 눌러 전체 테스트셋 평가를 실행하세요. (이미지 수에 따라 시간이 걸립니다)")
+        else:
+            seg_tag = f"{SEG_PATH}:{os.path.getmtime(SEG_PATH)}"
+            sev_tag = f"{SEV_PATH}:{os.path.getmtime(SEV_PATH)}"
+            ev = evaluate_all(tuple(sorted(df["filename"].tolist())), tau_e, seg_tag, sev_tag)
+
+            # ----- 병변 분할 -----
+            st.markdown("### 🟥 병변 분할 — EfficientNet-B0 + UNet++")
+            s = ev["seg"]
+            g1, g2, g3, g4 = st.columns(4)
+            g1.metric("평균 Dice", f"{s['dice']:.3f}")
+            g2.metric("평균 IoU", f"{s['iou']:.3f}")
+            g3.metric("Precision", f"{s['precision']:.3f}")
+            g4.metric("Recall", f"{s['recall']:.3f}")
+            st.caption(f"정답 병변 있는 이미지 {s['n']}장 기준 · τ={tau_e:.2f} · "
+                       "Dice/IoU는 이미지 평균, Precision/Recall은 픽셀 micro 평균")
+
+            st.divider()
+            # ----- 중증도 분류 -----
+            st.markdown("### 🟦 중증도 분류 — PVTv2-B0 + CORN")
+            summ = [{"지표": METRIC_KO[m], "N": ev["sev"][m]["n"],
+                     "정확도": ev["sev"][m]["acc"], "MAE": ev["sev"][m]["mae"],
+                     "QWK": ev["sev"][m]["qwk"]} for m in M.SEV_ORDER]
+            st.dataframe(
+                pd.DataFrame(summ).style.format({"정확도": "{:.3f}", "MAE": "{:.3f}", "QWK": "{:.3f}"}),
+                hide_index=True, use_container_width=True)
+            st.caption("정확도=정확히 맞춘 비율(↑좋음) · MAE=평균 등급오차(↓좋음) · "
+                       "QWK=순서형 가중 카파(1에 가까울수록↑, 등급 순서까지 반영한 일치도)")
+
+            st.markdown("##### 혼동행렬 (행=정답, 열=예측)")
+            for i in range(0, len(M.SEV_ORDER), 2):
+                cc = st.columns(2)
+                for j, m in enumerate(M.SEV_ORDER[i:i + 2]):
+                    classes = M.IGA_CLASSES if m == "iga" else M.SYMPTOM_CLASSES
+                    with cc[j]:
+                        st.plotly_chart(conf_heatmap(ev["sev"][m]["cm"], classes, METRIC_KO[m]),
+                                        use_container_width=True)
+
+# ==================== 탭4 — 이미지 추가 ====================
 with tab_upload:
     st.subheader("새 이미지 실시간 추론")
     st.caption("피부 이미지를 올리면 병변분할 + 중증도 분류를 앱에서 직접 실행합니다. "
