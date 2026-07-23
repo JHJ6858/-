@@ -428,11 +428,7 @@ with tab_view:
             i3.image(overlay(disp, mask, PR_COLOR), caption=f"🔴 예측 마스크 (τ={thr:.2f})",
                      use_container_width=True)
 
-            if has_gt and ga > 0:
-                r1, r2 = st.columns(2)
-                r1.metric("병변 인식률(recall)", f"{inter / ga * 100:.1f}%")
-                if pa > 0:
-                    r2.metric("검출 정확도(precision)", f"{inter / pa * 100:.1f}%")
+            
 
             st.markdown("##### 중증도 · 증상 — 예측/정답 배지 · 🟢 정답 맞춤 vs 🔴 정답 틀림")
             show_grades(out["grades"], gt_row=row)
