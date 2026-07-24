@@ -68,11 +68,12 @@ def get_sev():
 
 # ==================== 데이터셋(뷰어용) ====================
 def _data_url():
-    fallback = ""  # 예: "https://github.com/사용자/저장소/releases/download/v1/demo_assets.zip"
+    fallback = "https://github.com/JHJ6858/<저장소이름>/releases/download/v2/demo_assets.zip"
     try:
         return st.secrets.get("DEMO_ASSETS_URL", fallback)
     except Exception:
         return fallback
+
 
 
 @st.cache_resource(show_spinner="데이터셋을 내려받는 중… (최초 1회)")
