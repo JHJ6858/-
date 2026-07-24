@@ -3,4 +3,4 @@ numpy
 pandas
 pillow
 plotly
-ai-edge-litert
+ai-edge-litert==2.1.6
