@@ -68,11 +68,12 @@ def get_sev():
 
 # ==================== 데이터셋(뷰어용) ====================
 def _data_url():
-    fallback = "https://github.com/JHJ6858/<저장소이름>/releases/download/v2/demo_assets.zip"
+    fallback = "https://github.com/JHJ6858/-/releases/download/v2/demo_assets.zip"
     try:
         return st.secrets.get("DEMO_ASSETS_URL", fallback)
     except Exception:
         return fallback
+
 
 
 
